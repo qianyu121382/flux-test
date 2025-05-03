@@ -1,11 +1,12 @@
 import math
 from dataclasses import dataclass
-
+from functools import partial
 import torch
 from einops import rearrange
 from torch import Tensor, nn
 
 from flux.math import attention, rope
+from flux.ttt.models.cogvideo.utils import SequenceMetadata
 
 
 class EmbedND(nn.Module):
@@ -49,9 +50,6 @@ def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 10
     return embedding
 
 
-
-
-
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -60,7 +58,7 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x: Tensor):
         x_dtype = x.dtype
         x = x.float()
-        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+        rrms = torch.rsqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + 1e-6)
         return (x * rrms).to(dtype=x_dtype) * self.scale
 
 
@@ -171,7 +169,7 @@ class DoubleStreamBlock(nn.Module):
         v = torch.cat((txt_v, img_v), dim=2)
 
         attn = attention(q, k, v, pe=pe)
-        txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
+        txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
 
         # calculate the img bloks
         img = img + img_mod1.gate * self.img_attn.proj(img_attn)
@@ -190,17 +188,17 @@ class SingleStreamBlock(nn.Module):
     """
 
     def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        mlp_ratio: float = 4.0,
-        qk_scale: float | None = None,
+            self,
+            hidden_size: int,
+            num_heads: int,
+            mlp_ratio: float = 4.0,
+            qk_scale: float | None = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_size
         self.num_heads = num_heads
         head_dim = hidden_size // num_heads
-        self.scale = qk_scale or head_dim**-0.5
+        self.scale = qk_scale or head_dim ** -0.5
 
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
         # qkv and mlp_in
@@ -216,6 +214,66 @@ class SingleStreamBlock(nn.Module):
         self.mlp_act = nn.GELU(approximate="tanh")
         self.modulation = Modulation(hidden_size, double=False)
 
+        from flux.ttt.models.ssm.ttt_layer import TTTWrapper
+
+        self.ssm = TTTWrapper(config)
+
+    def _reverse_text_chunks(self, text_emb, num_chunks):
+        original_text_emb_shape = text_emb.shape
+        text_emb = rearrange(text_emb, "b (c s) e -> b c s e", c=num_chunks)
+        text_emb = torch.flip(text_emb, dims=[1])
+        return text_emb.view(original_text_emb_shape)
+
+    def _gate(self, text_gate, video_gate, residual, ssm_output, text_length):
+        return residual + torch.cat(
+            [text_gate(ssm_output[:, :text_length]), video_gate(ssm_output[:, text_length:])], dim=1
+        )
+
+    def _ssm_forward(self, emb: torch.Tensor, seq_metadata: SequenceMetadata):
+        text_length, num_chunks = seq_metadata.seq_text_length, seq_metadata.num_chunks
+
+        # Apply remat if configured
+        # Note: both forward and reverse ssm use the same ssm layer and parameters
+        forward_ssm = (
+            partial(torch.utils.checkpoint.checkpoint, self.ssm, use_reentrant=False)
+            if self.do_forward_ssm_remat
+            else self.ssm
+        )
+        reverse_ssm = (
+            partial(torch.utils.checkpoint.checkpoint, self.ssm, use_reentrant=False)
+            if self.do_reverse_ssm_remat
+            else self.ssm
+        )
+
+        # Embedding pre-forward ssm
+        residual_emb = emb.clone()
+
+        emb = forward_ssm(emb, seq_metadata)
+
+        emb = self._gate(self.forward_ssm_gating_text, self.forward_ssm_gating_video, residual_emb, emb, text_length)
+
+        # Embedding pre-reversed ssm
+        residual_emb = emb.clone()
+
+        # Reverse the text chunks to match reversed video chunks
+        if seq_metadata.is_multiscene:
+            emb[:, :text_length] = self._reverse_text_chunks(emb[:, :text_length], num_chunks)
+
+        # Reverse the video latent
+        emb[:, text_length:] = torch.flip(residual_emb[:, text_length:], dims=[1])
+
+        emb = reverse_ssm(emb, seq_metadata)
+
+        # Unreverse the text chunks to match reversed video chunks
+        if seq_metadata.is_multiscene:
+            emb[:, :text_length] = self._reverse_text_chunks(emb[:, :text_length], num_chunks)
+
+        # Unreverse the video latent
+        emb[:, text_length:] = torch.flip(emb[:, text_length:], dims=[1])
+
+        return self._gate(self.backward_ssm_gating_text, self.backward_ssm_gating_video, residual_emb, emb, text_length)
+
+
     def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
         mod, _ = self.modulation(vec)
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
@@ -228,6 +286,7 @@ class SingleStreamBlock(nn.Module):
         attn = attention(q, k, v, pe=pe)
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        output = self._ssm_forward(output, seq_metadata)
         return x + mod.gate * output
 
 
