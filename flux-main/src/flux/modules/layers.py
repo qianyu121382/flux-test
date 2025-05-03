@@ -273,9 +273,9 @@ class SingleStreamBlock(nn.Module):
 
         return self._gate(self.backward_ssm_gating_text, self.backward_ssm_gating_video, residual_emb, emb, text_length)
 
-
     def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
         mod, _ = self.modulation(vec)
+        print("vec的形状")
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
 
@@ -286,6 +286,7 @@ class SingleStreamBlock(nn.Module):
         attn = attention(q, k, v, pe=pe)
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        print("output的形状：", output.shape)
         output = self._ssm_forward(output, seq_metadata)
         return x + mod.gate * output
 
