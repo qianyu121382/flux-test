@@ -7,6 +7,7 @@ from torch import Tensor, nn
 
 from flux.math import attention, rope
 from flux.ttt.models.cogvideo.utils import SequenceMetadata
+from flux.ttt.models.configs import ModelConfig
 
 
 class EmbedND(nn.Module):
@@ -216,7 +217,7 @@ class SingleStreamBlock(nn.Module):
 
         from flux.ttt.models.ssm.ttt_layer import TTTWrapper
 
-        self.ssm = TTTWrapper(config)
+        self.ssm = TTTWrapper()
 
     def _reverse_text_chunks(self, text_emb, num_chunks):
         original_text_emb_shape = text_emb.shape
@@ -229,8 +230,8 @@ class SingleStreamBlock(nn.Module):
             [text_gate(ssm_output[:, :text_length]), video_gate(ssm_output[:, text_length:])], dim=1
         )
 
-    def _ssm_forward(self, emb: torch.Tensor, seq_metadata: SequenceMetadata):
-        text_length, num_chunks = seq_metadata.seq_text_length, seq_metadata.num_chunks
+    def _ssm_forward(self, emb: torch.Tensor):
+        text_length, num_chunks = (512, 1)
 
         # Apply remat if configured
         # Note: both forward and reverse ssm use the same ssm layer and parameters
@@ -248,7 +249,7 @@ class SingleStreamBlock(nn.Module):
         # Embedding pre-forward ssm
         residual_emb = emb.clone()
 
-        emb = forward_ssm(emb, seq_metadata)
+        emb = forward_ssm(emb)
 
         emb = self._gate(self.forward_ssm_gating_text, self.forward_ssm_gating_video, residual_emb, emb, text_length)
 
@@ -256,17 +257,17 @@ class SingleStreamBlock(nn.Module):
         residual_emb = emb.clone()
 
         # Reverse the text chunks to match reversed video chunks
-        if seq_metadata.is_multiscene:
-            emb[:, :text_length] = self._reverse_text_chunks(emb[:, :text_length], num_chunks)
+        # if seq_metadata.is_multiscene:
+        #     emb[:, :text_length] = self._reverse_text_chunks(emb[:, :text_length], num_chunks)
 
         # Reverse the video latent
         emb[:, text_length:] = torch.flip(residual_emb[:, text_length:], dims=[1])
 
-        emb = reverse_ssm(emb, seq_metadata)
+        emb = reverse_ssm(emb)
 
         # Unreverse the text chunks to match reversed video chunks
-        if seq_metadata.is_multiscene:
-            emb[:, :text_length] = self._reverse_text_chunks(emb[:, :text_length], num_chunks)
+        # if seq_metadata.is_multiscene:
+        #     emb[:, :text_length] = self._reverse_text_chunks(emb[:, :text_length], num_chunks)
 
         # Unreverse the video latent
         emb[:, text_length:] = torch.flip(emb[:, text_length:], dims=[1])
@@ -287,7 +288,7 @@ class SingleStreamBlock(nn.Module):
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
         print("output的形状：", output.shape)
-        output = self._ssm_forward(output, seq_metadata)
+        output = self._ssm_forward(output)
         return x + mod.gate * output
 
 
